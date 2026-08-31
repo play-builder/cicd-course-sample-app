@@ -1,0 +1,38 @@
+# syntax=docker/dockerfile:1
+
+FROM node:24-alpine AS deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev
+
+FROM node:24-alpine AS runtime
+
+RUN addgroup -g 1001 -S nodejs && adduser -S -u 1001 -G nodejs nodejs
+
+WORKDIR /app
+
+COPY --from=deps --chown=nodejs:nodejs /app/node_modules ./node_modules
+COPY --chown=nodejs:nodejs package.json ./
+COPY --chown=nodejs:nodejs src ./src
+
+USER nodejs
+
+ARG APP_VERSION=dev
+ARG GIT_SHA=unknown
+ARG BUILD_DATE=unknown
+
+ENV NODE_ENV=production
+ENV PORT=3000
+ENV APP_VERSION=$APP_VERSION
+ENV GIT_SHA=$GIT_SHA
+ENV BUILD_DATE=$BUILD_DATE
+
+LABEL org.opencontainers.image.title="sample-app"
+LABEL org.opencontainers.image.description="CI/CD 와 GitOps 강의용 샘플 애플리케이션"
+LABEL org.opencontainers.image.version=$APP_VERSION
+LABEL org.opencontainers.image.revision=$GIT_SHA
+LABEL org.opencontainers.image.created=$BUILD_DATE
+
+EXPOSE 3000
+
+CMD ["node", "src/server.js"]
