@@ -1,0 +1,15 @@
+node_modules
+coverage
+test
+
+.git
+.github
+.gitignore
+.dockerignore
+
+Dockerfile
+README.md
+eslint.config.js
+
+npm-debug.log*
+.DS_Store
