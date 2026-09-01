@@ -1,155 +1,149 @@
-# sample-app
+# CI/CD course sample application
 
-CI/CD 와 GitOps 강의의 배포 대상 애플리케이션입니다. 단일 서비스입니다.
+이 저장소는 CI/CD와 GitOps 강의에서 빌드·테스트·배포할 Node.js 24 애플리케이션의 전체
+코드입니다. 애플리케이션 코드와 GitOps desired state를 분리하며, CI는 ECR에 multi-architecture
+이미지 인덱스를 푸시한 뒤 **index digest만** `argocd-gitops` 저장소에 반영합니다.
 
-## endpoint
-
-| 경로 | 응답 | 쓰이는 모듈 |
-| --- | --- | --- |
-| `GET /` | version, gitSha, pod 이름 | M12 에서 stable 과 canary 응답 비율 확인 |
-| `GET /healthz` | 항상 200 | M11 livenessProbe |
-| `GET /readyz` | 준비 전 503, 준비 후 200 | M11 readinessProbe |
-| `GET /version` | version, gitSha, buildDate, nodeVersion | M13 에서 커밋이 운영까지 도달했는지 확인 |
-| `GET /config` | 주입 설정과 secret 키 이름, 존재 여부, 길이 | M14 External Secrets 주입 확인 |
-| `GET /metrics` | Prometheus 형식 지표 | M12 AnalysisTemplate |
-
-`GET /config` 는 secret 의 값을 내보내지 않습니다. 키 이름과 길이만 돌려줍니다.
-
-## 환경 변수
-
-| 이름 | 기본값 | 하는 일 | 쓰이는 모듈 |
-| --- | --- | --- | --- |
-| `PORT` | 3000 | listen 포트 | |
-| `APP_VERSION` | dev | `/` 와 `/version` 에 실리는 버전 | M12, M13 |
-| `GIT_SHA` | unknown | 빌드한 커밋 | M13 |
-| `BUILD_DATE` | unknown | 빌드 시각 | M13 |
-| `POD_NAME` | local | downward API 로 주입 | M11, M12 |
-| `NODE_NAME` | local | downward API 로 주입 | M11 |
-| `FAILURE_RATE` | 0 | `/` 응답을 500 으로 만드는 비율 0.0 ~ 1.0 | M12 자동 rollback |
-| `LATENCY_MS` | 0 | `/` 응답을 지연시키는 밀리초 | M12 지연 기반 analysis |
-| `READY_DELAY_MS` | 0 | 기동 후 readyz 를 켜기까지 기다리는 밀리초 | M11 rolling update 관찰 |
-| `SHUTDOWN_DELAY_MS` | 5000 | SIGTERM 수신 후 종료까지 기다리는 밀리초 | M11 무중단 배포 |
-| `SECRET_KEYS` | DB_HOST,DB_PASSWORD,API_KEY | `/config` 가 확인할 키 목록 | M14 |
-
-## 지표
+## 전체 흐름
 
 ```text
-http_requests_total{method,route,status}              Counter
-http_request_duration_seconds{method,route,status}    Histogram
-process_*, nodejs_*                                   기본 지표
+application PR merge
+        │
+        ▼
+lint + test → Buildx(amd64/arm64) → ECR index digest
+                                      │
+                   ┌──────────────────┴──────────────────┐
+                   ▼                                     ▼
+             dev digest PR                         prod promotion PR
+             validate + auto-merge                 CODEOWNERS approval
+                   │                                     │
+                   ▼                                     ▼
+             Argo CD Deployment                    Argo Rollouts Canary
 ```
 
-라벨 `app` 과 `version` 이 모든 지표에 붙습니다. `version` 으로 stable 과 canary 를 나눠
-집계할 수 있습니다.
+이 그림에서 봐야 할 핵심은 prod에서 새 이미지를 다시 빌드하지 않는다는 점입니다. dev에서
+검증한 동일 digest를 복사해야 공급망과 승격 이력을 추적할 수 있습니다.
 
-M12 AnalysisTemplate 이 쓸 오류율 계산 예시입니다.
+## 엔드포인트와 장애 주입
 
-```text
-sum(rate(http_requests_total{app="sample-app",version="[canary 버전]",status="500"}[1m]))
-/
-sum(rate(http_requests_total{app="sample-app",version="[canary 버전]"}[1m]))
-```
+| 경로 | 역할 |
+| --- | --- |
+| `GET /` | 버전 응답, `FAILURE_RATE`와 `LATENCY_MS` 적용 |
+| `GET /healthz` | liveness probe |
+| `GET /readyz` | readiness probe |
+| `GET /version` | digest와 연결할 build metadata 확인 |
+| `GET /config` | secret 값은 숨기고 키 존재 여부·길이만 반환 |
+| `GET /metrics` | AMP로 수집할 Prometheus metrics |
 
-## 오류 주입이 probe 에 영향을 주지 않는 이유
+`FAILURE_RATE`는 `/`에만 적용됩니다. Probe까지 실패시키면 카나리 분석이 아니라
+`CrashLoopBackOff` 실습이 되므로 의도적으로 분리했습니다.
 
-```text
-FAILURE_RATE 가 적용되는 곳    GET /  한 곳
-FAILURE_RATE 가 적용되지 않는 곳  /healthz, /readyz, /version, /config, /metrics
+## 로컬 검증
 
-livenessProbe 가 /healthz 를 보므로 오류를 주입해도 Pod 가 재시작되지 않는다
-Pod 가 살아 있어야 canary 분석이 실패하는 과정을 끝까지 볼 수 있다
-Pod 가 죽으면 분석이 아니라 CrashLoopBackOff 를 보게 된다
-```
-
-## 종료 순서
-
-```text
-SIGTERM 수신
-      │
-      ▼
-readyz 가 503 을 돌려주기 시작            Service endpoint 에서 빠진다
-      │
-      │  SHUTDOWN_DELAY_MS 만큼 기다린다   진행 중인 요청을 마친다
-      ▼
-server.close()
-      │
-      ▼
-process.exit(0)
-```
-
-`terminationGracePeriodSeconds` 는 `SHUTDOWN_DELAY_MS` 보다 크게 잡습니다.
-작게 잡으면 종료 대기가 끝나기 전에 SIGKILL 이 옵니다.
-
-## 로컬 실행
-
-`의존성 설치`
+의존성은 lock 파일 그대로 설치합니다.
 
 ```bash
-npm install
-```
-
-`테스트 실행`
-
-```bash
-npm test
-```
-
-`lint 실행`
-
-```bash
+npm ci
 npm run lint
+npm test
+bash test/curl-loop.test.sh
 ```
 
-`서버 실행`
+애플리케이션 실행:
 
 ```bash
 npm start
+curl -fsS http://127.0.0.1:3000/readyz
+curl -fsS http://127.0.0.1:3000/version
 ```
 
-`오류 주입 상태로 실행`
+장애 응답을 생성할 때는 별도 shell에서 요청 부하를 유지합니다.
 
 ```bash
 FAILURE_RATE=0.5 npm start
+bash scripts/curl-loop.sh http://127.0.0.1:3000/ 0.2
 ```
 
-## 이미지 빌드
+종료 시 애플리케이션은 먼저 readiness를 내리고 `SHUTDOWN_DELAY_MS` 동안 in-flight 요청을
+기다린 뒤 종료합니다. Kubernetes의 `terminationGracePeriodSeconds`는 이 값보다 커야 합니다.
 
-`빌드 인자와 함께 빌드`
+## Container image 계약
+
+Dockerfile은 Node `24.20.0-alpine3.23`의 multi-architecture index digest로 base image를
+고정합니다. 로컬 단일 아키텍처 확인은 다음과 같습니다.
 
 ```bash
-docker build --build-arg APP_VERSION=v1.0.0 --build-arg GIT_SHA=$(git rev-parse HEAD) --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) -t sample-app:v1.0.0 .
+docker build \
+  --build-arg APP_VERSION=local \
+  --build-arg GIT_SHA=local \
+  --build-arg BUILD_DATE=2026-09-01T00:00:00Z \
+  -t sample-app:local .
 ```
 
-## 수동으로 해야 하는 단계
+CI에서는 `linux/amd64,linux/arm64`를 동시에 push하며 action 출력의 digest를 다시 inspect합니다.
 
-```text
-1. npm install 을 한 번 실행해 package-lock.json 을 만들고 커밋한다
-   Dockerfile 의 npm ci 가 lock 파일을 요구한다
-
-2. 의존성 버전 범위를 확인한다
-   express ^5.1.0, prom-client ^15.1.3, eslint ^9.0.0 으로 적어 두었다
-   설치 시점의 최신 minor 를 확인하고 필요하면 범위를 올린다
-
-3. 저장소 위치를 정한다
-   argocd-gitops 안의 app/ 로 넣을지 앱 저장소를 따로 팔지 미정이다
+```bash
+docker buildx imagetools inspect \
+  <account>.dkr.ecr.<region>.amazonaws.com/playdevops/sample-app@sha256:<digest>
 ```
 
-## 검증 불가 항목
+정상 결과에는 `linux/amd64`와 `linux/arm64` platform manifest가 모두 보여야 합니다.
 
-```text
-node --test --experimental-test-coverage 는 Node 24 에서도 experimental 표시가 붙어 있다
-CI 에서는 npm test 를 쓰고, 커버리지가 필요하면 npm run test:coverage 를 쓴다
-플래그 이름이 바뀔 수 있으므로 녹화 전에 다시 확인한다
-```
+## GitHub repository 설정
 
-## 이 저장소에 없는 것
+Repository variables:
 
-```text
-.github/workflows/    M03 부터 M05 까지 수강생이 직접 만든다
-kustomize/, charts/   배포 대상 상태는 argocd-gitops 에 둔다
-terraform/            cluster 는 EKS-infra 가 만든다
-```
+| 이름 | 값 |
+| --- | --- |
+| `AWS_REGION` | 예: `us-east-1` |
+| `AWS_ROLE_ARN` | EKS-infra의 `sample_app_push_role_arn` 출력 |
+| `ECR_REPOSITORY` | `playdevops/sample-app` |
+| `GITOPS_APP_ID` | GitOps용 GitHub App ID |
+| `GITOPS_OWNER` | GitOps 저장소 owner |
+| `GITOPS_REPOSITORY_NAME` | GitOps 저장소 이름 |
 
-애플리케이션 소스와 배포 대상 상태를 같은 저장소에 두면 CI 가 만든 커밋이 다시 CI 를
-실행시키고, 코드 리뷰 대상과 배포 승인 대상이 섞입니다. Argo CD 공식 문서도 설정 저장소를
-소스 저장소와 분리할 것을 권장합니다.
+Repository secret:
+
+| 이름 | 값 |
+| --- | --- |
+| `GITOPS_APP_PRIVATE_KEY` | GitHub App private key PEM 전체 |
+
+GitHub App은 `argocd-gitops` 저장소에 설치하고 최소한 다음 repository permission을 줍니다.
+
+- Contents: Read and write
+- Pull requests: Read and write
+
+`ci.yml`의 AWS 접근은 장기 access key가 아니라 GitHub OIDC를 사용합니다. Trust policy는
+`main`과 `dev` branch ref만 허용하며 PR workflow에는 AWS 권한이 없습니다.
+
+## Workflow 책임
+
+| 파일 | 실행 시점 | 결과 |
+| --- | --- | --- |
+| `.github/workflows/test.yml` | application PR | lint, unit/integration test, image build |
+| `.github/workflows/ci.yml` | `main`/`dev` push | ECR push, dev digest PR, validation 후 auto-merge |
+| `.github/workflows/promote.yml` | 수동 dispatch | 현재 dev digest를 prod에 복사한 승인 PR |
+
+GitHub App token의 push가 GitOps validate workflow를 한 번 실행하는 것은 정상입니다. 자동화가
+같은 digest를 다시 쓰지 않도록 `gitops-values.mjs`가 idempotent하게 동작하므로 무한 trigger
+loop가 생기지 않습니다. `envs/dev/**`를 `paths-ignore`하거나 `[skip ci]`로 validation을
+우회하지 않습니다.
+
+## 정상 결과와 실패 확인
+
+정상 CI 결과:
+
+- `npm ci`, lint, test 모두 성공
+- ECR image가 immutable tag와 index digest를 가짐
+- dev PR diff는 `envs/dev/values.yaml`의 repository/digest 두 값뿐임
+- prod promotion은 dev와 byte-for-byte 동일한 digest를 사용함
+
+주요 실패 원인:
+
+- `AccessDenied`: `AWS_ROLE_ARN`, OIDC subject, ECR push policy 확인
+- `ImageTagAlreadyExistsException`: 재실행 tag에 run ID/attempt가 포함됐는지 확인
+- `ImagePullBackOff`: index digest인지와 worker node role의 ECR pull policy 확인
+- GitOps PR 생성 실패: GitHub App 설치 대상과 Contents/PR permission 확인
+
+버전 계약은 [versions.lock.yaml](./versions.lock.yaml)에 있으며, 배포 manifest는 이 저장소가
+아니라 `argocd-gitops`에서 관리합니다.
