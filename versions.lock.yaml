@@ -1,0 +1,17 @@
+schemaVersion: 1
+verifiedAt: "2026-09-01"
+
+runtime:
+  node: "24.20.0"
+  alpine: "3.23"
+  baseImageIndexDigest: "sha256:0388af2af070cd4736a1567cfed02469ba117848845b4165d87a333edb53d2ca"
+
+dependencies:
+  express: "5.2.1"
+  prometheusClient: "0.16.1"
+  eslint: "10.9.1"
+
+delivery:
+  targetPlatforms:
+    - linux/amd64
+    - linux/arm64
