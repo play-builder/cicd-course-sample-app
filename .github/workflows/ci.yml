@@ -1,0 +1,144 @@
+name: build-and-deploy-dev
+
+on:
+  push:
+    branches: [main, dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: dev-delivery-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      image_repository: ${{ steps.image.outputs.repository }}
+      image_digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Checkout application
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 24.20.0
+          cache: npm
+
+      - name: Install and test
+        run: |
+          npm ci
+          npm run lint
+          npm test
+
+      - name: Configure AWS credentials with GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@cabfdba3510de1431bac9dba27511d97497fc100 # v5
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2
+
+      - name: Set image repository
+        id: image
+        run: echo "repository=${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build and push multi-architecture image
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.image.outputs.repository }}:sha-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          build-args: |
+            APP_VERSION=${{ github.sha }}
+            GIT_SHA=${{ github.sha }}
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+
+      - name: Verify image index digest
+        run: |
+          test -n "${{ steps.build.outputs.digest }}"
+          docker buildx imagetools inspect \
+            "${{ steps.image.outputs.repository }}@${{ steps.build.outputs.digest }}"
+
+  update-dev-gitops:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout application scripts
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          path: app
+
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.GITOPS_APP_ID }}
+          private-key: ${{ secrets.GITOPS_APP_PRIVATE_KEY }}
+          owner: ${{ vars.GITOPS_OWNER }}
+          repositories: ${{ vars.GITOPS_REPOSITORY_NAME }}
+
+      - name: Checkout GitOps repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: ${{ vars.GITOPS_OWNER }}/${{ vars.GITOPS_REPOSITORY_NAME }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: gitops
+
+      - name: Update dev image index digest
+        id: update
+        run: |
+          node app/scripts/gitops-values.mjs set \
+            gitops/envs/dev/values.yaml \
+            "${{ needs.build.outputs.image_repository }}" \
+            "${{ needs.build.outputs.image_digest }}"
+
+          if git -C gitops diff --quiet -- envs/dev/values.yaml; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit the digest-only change
+        if: steps.update.outputs.changed == 'true'
+        id: commit
+        run: |
+          branch="automation/dev-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          git -C gitops config user.name "gitops-delivery[bot]"
+          git -C gitops config user.email "gitops-delivery[bot]@users.noreply.github.com"
+          git -C gitops switch -c "$branch"
+          git -C gitops add envs/dev/values.yaml
+          git -C gitops commit -m "deploy(dev): ${GITHUB_SHA} index digest"
+          git -C gitops push origin "$branch"
+
+      - name: Open and auto-merge the dev GitOps PR
+        if: steps.update.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ vars.GITOPS_OWNER }}/${{ vars.GITOPS_REPOSITORY_NAME }}
+        run: |
+          pr_url=$(gh pr create \
+            --repo "$GH_REPO" \
+            --base main \
+            --head "${{ steps.commit.outputs.branch }}" \
+            --title "deploy(dev): ${{ github.sha }}" \
+            --body "Multi-arch image index: ${{ needs.build.outputs.image_repository }}@${{ needs.build.outputs.image_digest }}")
+          gh pr merge "$pr_url" --auto --squash --delete-branch

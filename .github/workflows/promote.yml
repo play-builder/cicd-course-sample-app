@@ -1,0 +1,85 @@
+name: promote-dev-digest-to-prod
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_digest:
+        description: Optional dev index digest to promote; blank uses the current dev value
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  promotion-pr:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout application scripts
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          path: app
+
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.GITOPS_APP_ID }}
+          private-key: ${{ secrets.GITOPS_APP_PRIVATE_KEY }}
+          owner: ${{ vars.GITOPS_OWNER }}
+          repositories: ${{ vars.GITOPS_REPOSITORY_NAME }}
+
+      - name: Checkout GitOps repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: ${{ vars.GITOPS_OWNER }}/${{ vars.GITOPS_REPOSITORY_NAME }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: gitops
+
+      - name: Copy the exact dev digest to prod
+        id: update
+        env:
+          EXPECTED_DIGEST: ${{ inputs.expected_digest }}
+        run: |
+          args=(
+            promote
+            gitops/envs/dev/values.yaml
+            gitops/envs/prod/values.yaml
+          )
+          if [[ -n "$EXPECTED_DIGEST" ]]; then
+            args+=("$EXPECTED_DIGEST")
+          fi
+          node app/scripts/gitops-values.mjs "${args[@]}"
+
+          if git -C gitops diff --quiet -- envs/prod/values.yaml; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit promotion
+        if: steps.update.outputs.changed == 'true'
+        id: commit
+        run: |
+          branch="promotion/prod-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          git -C gitops config user.name "gitops-delivery[bot]"
+          git -C gitops config user.email "gitops-delivery[bot]@users.noreply.github.com"
+          git -C gitops switch -c "$branch"
+          git -C gitops add envs/prod/values.yaml
+          git -C gitops commit -m "promote(prod): verified dev index digest"
+          git -C gitops push origin "$branch"
+
+      - name: Open production approval PR
+        if: steps.update.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ vars.GITOPS_OWNER }}/${{ vars.GITOPS_REPOSITORY_NAME }}
+        run: |
+          gh pr create \
+            --repo "$GH_REPO" \
+            --base main \
+            --head "${{ steps.commit.outputs.branch }}" \
+            --title "promote(prod): current verified dev digest" \
+            --body "CODEOWNERS approval is required. Merge starts the production Canary; this workflow never auto-merges production."
