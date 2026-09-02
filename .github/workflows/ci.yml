@@ -2,7 +2,7 @@ name: build-and-deploy-dev
 
 on:
   push:
-    branches: [main, dev]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -10,7 +10,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: dev-delivery-${{ github.ref }}
+  group: dev-delivery
   cancel-in-progress: false
 
 jobs:
@@ -37,7 +37,7 @@ jobs:
           npm test
 
       - name: Configure AWS credentials with GitHub OIDC
-        uses: aws-actions/configure-aws-credentials@cabfdba3510de1431bac9dba27511d97497fc100 # v5
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
@@ -72,7 +72,7 @@ jobs:
 
       - name: Verify image index digest
         run: |
-          test -n "${{ steps.build.outputs.digest }}"
+          [[ -n "${{ steps.build.outputs.digest }}" ]]
           docker buildx imagetools inspect \
             "${{ steps.image.outputs.repository }}@${{ steps.build.outputs.digest }}"
 
@@ -142,3 +142,4 @@ jobs:
             --title "deploy(dev): ${{ github.sha }}" \
             --body "Multi-arch image index: ${{ needs.build.outputs.image_repository }}@${{ needs.build.outputs.image_digest }}")
           gh pr merge "$pr_url" --auto --squash --delete-branch
+          bash app/scripts/wait-pr-terminal-state.sh "$pr_url" "$GH_REPO"
